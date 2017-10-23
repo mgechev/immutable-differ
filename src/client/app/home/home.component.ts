@@ -1,4 +1,5 @@
 import {
+  Injectable,
   Component,
   OnInit,
   NgIterable,
@@ -792,13 +793,239 @@ class ImmutableListIterableDiffer<V> implements IterableDiffer<V>, IterableChang
   }
 }
 
-export class ImmutableListIterableDifferFactory implements IterableDifferFactory {
+enum ChangeType {
+  Update,
+  Add,
+  Remove,
+  Move
+}
+
+class IterableChangeRecordType<V> {
+  constructor(public record: IterableChangeRecord<V>, public type: ChangeType) {}
+}
+
+////////////////////////////////////////////////////
+class PersistentListIterableDifferIterator<V> implements Iterator<V> {
+  private _pointer = 0;
+
+  constructor(private _data: PersistentListIterableDiffer<V>) {}
+
+  public next(): IteratorResult<V> {
+    if (this._pointer < this._data.length) {
+      return {
+        done: false,
+        value: this._data.get(this._pointer++)
+      };
+    } else {
+      return {
+        done: true,
+        value: null
+      };
+    }
+  }
+}
+
+export class PersistentListIterableDiffer<V> implements IterableDiffer<V>, IterableChanges<V> {
+  private _itemIdx = new Map<V, number[]>();
+  private _trackByFn: TrackByFunction<V>;
+  private _data: IterableChangeRecord<V>[] = [];
+  private _bufferedChanges: IterableChangeRecordType<V>[] = [];
+  private _changes: IterableChangeRecordType<V>[] = [];
+
+  constructor() {
+    this._trackByFn = trackByIdentity;
+  }
+
+  get collection() {
+    return this._data.map(v => v.item);
+  }
+
+  get length() {
+    return this._data.length;
+  }
+
+  get(idx: number): V {
+    return this._data[idx].item;
+  }
+
+  [Symbol.iterator](): PersistentListIterableDifferIterator<V> {
+    return new PersistentListIterableDifferIterator(this);
+  }
+
+  push(value: V): number {
+    const data: IterableChangeRecord<V> = {
+      currentIndex: this._data.length,
+      previousIndex: null,
+      item: value,
+      trackById: this._trackByFn
+    };
+    const change = new IterableChangeRecordType(data, ChangeType.Add);
+    this._bufferedChanges.push(change);
+    return this._data.push(data);
+  }
+
+  unshift(value: V): number {
+    const data: IterableChangeRecord<V> = {
+      currentIndex: 0,
+      previousIndex: null,
+      item: value,
+      trackById: this._trackByFn
+    };
+    const change = new IterableChangeRecordType(data, ChangeType.Add);
+    this._bufferedChanges.push(change);
+    return this._data.push(data);
+  }
+
+  set(idx: number, value: V) {
+    const data: IterableChangeRecord<V> = {
+      currentIndex: idx,
+      previousIndex: null,
+      item: value,
+      trackById: this._trackByFn
+    };
+    const change = new IterableChangeRecordType(data, ChangeType.Add);
+    this._bufferedChanges.push(change);
+    if (this._data[idx]) {
+      this._bufferedChanges.push(
+        new IterableChangeRecordType(
+          {
+            currentIndex: null,
+            previousIndex: idx,
+            item: this._data[idx].item,
+            trackById: this._trackByFn
+          },
+          ChangeType.Remove
+        )
+      );
+    }
+    return (this._data[idx] = data);
+  }
+
+  indexOf(item: V) {
+    for (let i = 0; i < this._data.length; i += 1) {
+      if (looseIdentical(this._data[i].item, item)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  removeIndex(idx: number) {
+    const data: IterableChangeRecord<V> = {
+      currentIndex: null,
+      previousIndex: idx,
+      item: this.get(idx),
+      trackById: this._trackByFn
+    };
+    const change = new IterableChangeRecordType(data, ChangeType.Remove);
+    this._bufferedChanges.push(change);
+    return data.item;
+  }
+
+  forEachItem(fn: (record: IterableChangeRecord<V>) => void) {
+    for (let i = 0; i < this._data.length; i += 1) {
+      fn(this._data[i]);
+    }
+  }
+
+  forEachOperation(
+    fn: (item: IterableChangeRecord<V>, previousIndex: number | null, currentIndex: number | null) => void
+  ) {
+    for (let i = 0; i < this._changes.length; i += 1) {
+      const record = this._changes[i].record;
+      fn(record, record.previousIndex, record.currentIndex);
+    }
+  }
+
+  forEachPreviousItem(fn: (record: IterableChangeRecord_<V>) => void) {
+    // Do nothing
+  }
+
+  forEachAddedItem(fn: (record: IterableChangeRecord<V>) => void) {
+    for (let i = 0; i < this._changes.length; i += 1) {
+      const record = this._changes[i];
+      if (record.type === ChangeType.Add) {
+        fn(record.record);
+      }
+    }
+  }
+
+  forEachMovedItem(fn: (record: IterableChangeRecord<V>) => void) {
+    for (let i = 0; i < this._changes.length; i += 1) {
+      const record = this._changes[i];
+      if (record.type === ChangeType.Move) {
+        fn(record.record);
+      }
+    }
+  }
+
+  forEachRemovedItem(fn: (record: IterableChangeRecord<V>) => void) {
+    for (let i = 0; i < this._changes.length; i += 1) {
+      const record = this._changes[i];
+      if (record.type === ChangeType.Remove) {
+        fn(record.record);
+      }
+    }
+  }
+
+  forEachIdentityChange(fn: (record: IterableChangeRecord<V>) => void) {
+    for (let i = 0; i < this._changes.length; i += 1) {
+      const record = this._changes[i];
+      if (record.type === ChangeType.Update) {
+        fn(record.record);
+      }
+    }
+  }
+
+  diff(collection: NgIterable<V>): PersistentListIterableDiffer<V> | null {
+    if (this.check()) {
+      return this;
+    } else {
+      return null;
+    }
+  }
+
+  onDestroy() {}
+
+  check(): boolean {
+    this._changes = this._bufferedChanges;
+    this._reset();
+    return this.isDirty;
+  }
+
+  /* CollectionChanges is considered dirty if it has any additions, moves, removals, or identity
+   * changes.
+   */
+  get isDirty(): boolean {
+    return this._changes.length > 0;
+  }
+
+  /**
+   * Reset the state of the change objects to show no changes. This means set previousKey to
+   * currentKey, and clear all of the queues (additions, moves, removals).
+   * Set the previousIndexes of moved and added items to their currentIndexes
+   * Reset the list of additions, moves and removals
+   *
+   * @internal
+   */
+  _reset() {
+    if (this.isDirty) {
+      this._bufferedChanges = [];
+    }
+  }
+}
+////////////////////////////////////////////////////
+
+@Injectable()
+export class ImmutableListIterableDifferFactory<V> implements IterableDifferFactory {
+  constructor(private differ: PersistentListIterableDiffer<V>) {}
+
   supports(objects: any): boolean {
     return true;
   }
 
-  create<V>(trackByFn?: TrackByFunction<V>): IterableDiffer<V> {
-    return new ImmutableListIterableDiffer<V>();
+  create(trackByFn?: TrackByFunction<V>): IterableDiffer<V> {
+    return this.differ;
   }
 }
 
@@ -826,17 +1053,21 @@ export function iterateListLike(obj: any, fn: (p: any) => any) {
   styleUrls: ['home.component.css'],
   providers: [
     {
+      provide: PersistentListIterableDiffer,
+      useClass: PersistentListIterableDiffer
+    },
+    {
       provide: IterableDiffers,
-      useFactory(): IterableDiffers {
-        return new IterableDiffers([new ImmutableListIterableDifferFactory()]);
-      }
+      useFactory<V>(differ: PersistentListIterableDiffer<V>) {
+        return new IterableDiffers([new ImmutableListIterableDifferFactory(differ)]);
+      },
+      deps: [PersistentListIterableDiffer]
     }
   ]
 })
 export class HomeComponent implements OnInit {
   newName: string = '';
   errorMessage: string;
-  names = List<string>();
 
   /**
    * Creates an instance of the HomeComponent with the injected
@@ -844,7 +1075,7 @@ export class HomeComponent implements OnInit {
    *
    * @param {NameListService} nameListService - The injected NameListService.
    */
-  constructor(public nameListService: NameListService) {}
+  constructor(public nameListService: NameListService, public names: PersistentListIterableDiffer<string>) {}
 
   /**
    * Get the names OnInit
@@ -866,7 +1097,7 @@ export class HomeComponent implements OnInit {
    */
   addName(): boolean {
     // TODO: implement nameListService.post
-    this.names = this.names.push(this.newName);
+    this.names.push(this.newName);
     this.newName = '';
     return false;
   }
